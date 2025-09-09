@@ -1,96 +1,108 @@
 import os
 import asyncio
+from fastapi import FastAPI, Response
+from fastapi.responses import FileResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from pdf_to_text import convert_pdf_to_txt
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from pdf_to_text import pdf_to_txt
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+DOMAIN = os.getenv("DOMAIN", "http://localhost:8000")
 
-# Приветствие с красивыми кнопками
+if not TELEGRAM_TOKEN:
+    raise ValueError("Set TELEGRAM_TOKEN env var")
+
+# FastAPI для отдачи больших файлов
+app = FastAPI()
+FILES_DIR = "converted_files"
+os.makedirs(FILES_DIR, exist_ok=True)
+
+@app.get("/files/{filename}")
+async def serve_file(filename: str):
+    path = os.path.join(FILES_DIR, filename)
+    if os.path.exists(path):
+        return FileResponse(path, filename=filename)
+    return Response("File not found", status_code=404)
+
+# Telegram bot
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствие с кнопками"""
     keyboard = [
-        [InlineKeyboardButton("Конвертировать PDF", callback_data="convert")],
+        [InlineKeyboardButton("Конвертировать PDF", callback_data="convert_pdf")],
         [InlineKeyboardButton("Помощь", callback_data="help")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Привет! Я бот, который конвертирует PDF в текст. Выберите действие ниже 👇",
+        "Привет! Я PDF-конвертер.\nВыберите действие кнопкой ниже.",
         reply_markup=reply_markup
     )
 
-# Обработка кнопок
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "convert":
-        await query.edit_message_text("Отправьте PDF-файл для конвертации.")
+    if query.data == "convert_pdf":
+        await query.edit_message_text("Отправьте PDF-файл, который нужно конвертировать.")
     elif query.data == "help":
-        await query.edit_message_text("Просто отправьте PDF-файл, и я конвертирую его в текст.")
+        await query.edit_message_text("Просто отправьте PDF-файл, и я верну текстовый файл.")
 
-# Обработка PDF
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    file_id = doc.file_id
-    file_name = doc.file_name
-    file_size = doc.file_size
+    file = await context.bot.get_file(update.message.document.file_id)
+    file_name = update.message.document.file_name
+    local_path = os.path.join(FILES_DIR, file_name)
+    await file.download_to_drive(local_path)
 
-    file_path = os.path.join(UPLOAD_FOLDER, file_name)
-    file = await context.bot.get_file(file_id)
-    await file.download_to_drive(file_path)
+    # Если файл >50 МБ → просим оплату (пока закомментировано)
+    # if update.message.document.file_size > 50*1024*1024:
+    #     await update.message.reply_text("Файл слишком большой. Пожалуйста, оплатите через ЮKassa.")
+    #     return
 
-    # Ответим пользователю сразу
-    await update.message.reply_text(f"Файл {file_name} принят. Конвертация запущена...")
-
-    # Фоновая задача
-    asyncio.create_task(convert_and_send(file_path, update, context))
-
-# Асинхронная конвертация и отправка
-async def convert_and_send(file_path: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        output_txt = os.path.splitext(file_path)[0] + ".txt"
-        convert_pdf_to_txt(file_path, output_txt)
-
-        # Проверяем размер
-        if os.path.getsize(output_txt) <= 50 * 1024 * 1024:
-            await context.bot.send_document(chat_id=update.effective_chat.id, document=open(output_txt, "rb"))
+    output_file = os.path.join(FILES_DIR, file_name.rsplit(".",1)[0]+".txt")
+    await update.message.reply_text("Начинаю конвертацию...")
+    loop = asyncio.get_running_loop()
+    success = await loop.run_in_executor(None, pdf_to_txt, local_path, output_file)
+    if success:
+        if os.path.getsize(output_file) > 50*1024*1024:
+            # Для больших файлов даём ссылку
+            await update.message.reply_text(f"Файл слишком большой для отправки напрямую. Скачайте по ссылке:\n{DOMAIN}/files/{os.path.basename(output_file)}")
         else:
-            # Генерируем ссылку для скачивания (FastAPI)
-            file_url = f"{os.getenv('DOMAIN', 'http://localhost:8000')}/files/{os.path.basename(output_txt)}"
-            await update.message.reply_text(f"Файл слишком большой для Telegram (>50МБ).\nСкачайте здесь: {file_url}")
+            await update.message.reply_document(document=open(output_file, "rb"))
+    else:
+        await update.message.reply_text("Ошибка при конвертации PDF.")
 
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка конвертации: {e}")
+async def main():
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.COMMAND, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    # Callback кнопки
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    application.add_handler(MessageHandler(filters.ALL, start))
+    # Inline кнопки
+    from telegram.ext import CallbackQueryHandler
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-# FastAPI сервер для отдачи файлов
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+    await application.initialize()
+    await application.start()
+    print("Telegram bot started")
+    await application.updater.start_polling()
+    await application.updater.idle()
 
-app = FastAPI()
-
-@app.get("/files/{filename}")
-async def get_file(filename: str):
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    if os.path.exists(file_path):
-        return FileResponse(file_path, filename=filename)
-    return {"error": "Файл не найден"}
-
-# Основная функция запуска
-def main():
-    if not TELEGRAM_TOKEN:
-        print("[ERROR] Установите TELEGRAM_TOKEN")
-        return
-
-    tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-    tg_app.add_handler(MessageHandler(filters.Regex("convert|help"), button_handler))
-
-    # Запуск Telegram бота и FastAPI вместе
-    import uvicorn
-    asyncio.create_task(uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000))))
-    tg_app.run_polling()
-
+# Для запуска через uvicorn
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    import threading
+    # Запуск FastAPI в отдельном потоке
+    threading.Thread(target=lambda: uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))).start()
+    asyncio.run(main())
