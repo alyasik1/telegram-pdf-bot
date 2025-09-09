@@ -1,5 +1,4 @@
 import os
-import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -23,11 +22,12 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'help':
         await query.edit_message_text(text="Этот бот конвертирует PDF в текст.")
 
-async def main():
+def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button))
-    await app.run_polling()
+    # Запуск polling без asyncio.run
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
