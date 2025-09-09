@@ -1,0 +1,5 @@
+setx TELEGRAM_TOKEN "8373888482:AAH1ga1LlFiQ9HO46hTr-QROrNKxbKwqZog"
+setx TESSETACT_CMD "C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+$env:TELEGRAM_TOKEN = "8373888482:AAH1ga1LlFiQ9HO46hTr-QROrNKxbKwqZog"
+$env:TESSETACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
