@@ -10,3 +10,4 @@ Pillow
 tqdm
 aiofiles
 sqlalchemy
+httpx~=0.25.0

@@ -1,0 +1,14 @@
+{
+  "build": {
+    "builder": "python",
+    "buildCommand": "pip install -r requirements.txt"
+  },
+  "deploy": {
+    "startCommand": "python bot_server.py",
+    "env": {
+      "TELEGRAM_TOKEN": "",
+      "DOMAIN": "",
+      "TESSETACT_CMD": "/usr/bin/tesseract"
+    }
+  }
+}
