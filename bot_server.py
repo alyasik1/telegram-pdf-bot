@@ -1,129 +1,107 @@
 import os
-import aiofiles
+import logging
+import tempfile
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters
-)
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+
+from pdfminer.high_level import extract_text
 from PyPDF2 import PdfReader
 
-# Токен берем из переменных Railway
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# --- ЛОГИ ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Папка для временных файлов
-UPLOAD_DIR = "/app/uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# --- TELEGRAM TOKEN ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # например: https://your-app.up.railway.app/webhook
+
+# --- FASTAPI ---
+app = FastAPI()
+
+# --- TELEGRAM APP ---
+telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 
-# 📌 Главное меню
+# --- КНОПКИ ---
 def main_menu():
     keyboard = [
-        [InlineKeyboardButton("📄 Отправить PDF", callback_data="send_pdf")],
-        [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")]
+        [InlineKeyboardButton("📄 Конвертировать PDF → TXT", callback_data="convert_txt")],
+        [InlineKeyboardButton("🔍 OCR (распознать текст)", callback_data="convert_ocr")],
+        [InlineKeyboardButton("✂️ Разделить PDF", callback_data="split_pdf")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-# 📌 Приветствие
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- ОБРАБОТЧИКИ ---
+async def start(update: Update, context):
     await update.message.reply_text(
-        "👋 Привет! Я — *PDF → TXT бот*.\n\n"
-        "📌 Я могу конвертировать PDF в текстовый файл.\n\n"
-        "Выберите действие:",
-        reply_markup=main_menu(),
-        parse_mode="Markdown"
+        "👋 Привет! Я помогу работать с PDF.\n\n"
+        "Загрузи PDF и выбери, что сделать:",
+        reply_markup=main_menu()
     )
 
 
-# 📌 Обработка кнопок
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_file(update: Update, context):
+    file = await update.message.document.get_file()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        await file.download_to_drive(custom_path=tmp.name)
+        context.user_data["pdf_path"] = tmp.name
+
+    await update.message.reply_text(
+        "📥 Файл получен! Теперь выбери действие:",
+        reply_markup=main_menu()
+    )
+
+
+async def button_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "send_pdf":
-        await query.edit_message_text(
-            "📤 Отправьте PDF-файл (до *200 МБ*), и я сконвертирую его в текст."
-        )
-    elif query.data == "help":
-        await query.edit_message_text(
-            "ℹ️ *Инструкция:*\n\n"
-            "1️⃣ Нажмите «📄 Отправить PDF»\n"
-            "2️⃣ Загрузите PDF до 200 МБ\n"
-            "3️⃣ Получите обратно текстовый файл `.txt`\n\n"
-            "👉 Очень удобно для чтения больших документов.",
-            parse_mode="Markdown",
-            reply_markup=main_menu()
-        )
-
-
-# 📌 Сохранение и конвертация PDF
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = update.message.document
-
-    # Проверяем формат
-    if not file.file_name.endswith(".pdf"):
-        await update.message.reply_text("❌ Пожалуйста, отправьте именно *PDF* файл.", parse_mode="Markdown")
+    pdf_path = context.user_data.get("pdf_path")
+    if not pdf_path:
+        await query.edit_message_text("❌ Сначала загрузи PDF-файл.")
         return
 
-    # Ограничение размера
-    if file.file_size > 200 * 1024 * 1024:
-        await update.message.reply_text("⚠️ Файл слишком большой. Максимум *200 МБ*.", parse_mode="Markdown")
-        return
+    if query.data == "convert_txt":
+        await query.edit_message_text("🔄 Конвертирую PDF в текст...")
+        text = extract_text(pdf_path)
+        if not text.strip():
+            await query.edit_message_text("⚠️ Не удалось извлечь текст (попробуй OCR).")
+        else:
+            if len(text) > 4000:
+                text = text[:4000] + "\n\n... ✂️ Текст обрезан."
+            await query.edit_message_text("✅ Готово! Вот текст:\n\n" + text)
 
-    await update.message.reply_text("📥 Загружаю файл...")
+    elif query.data == "convert_ocr":
+        await query.edit_message_text("🔍 OCR пока не подключён (Tesseract нужен).")
 
-    # Сохраняем PDF
-    new_file = await context.bot.get_file(file.file_id)
-    file_path = os.path.join(UPLOAD_DIR, file.file_name)
-
-    async with aiofiles.open(file_path, "wb") as f:
-        await new_file.download_to_memory(out=f)
-
-    await update.message.reply_text("🔄 Конвертирую PDF в текст...")
-
-    # Конвертация
-    try:
-        text_file_path = file_path.replace(".pdf", ".txt")
-
-        reader = PdfReader(file_path)
-        extracted_text = []
-
-        for page in reader.pages:
-            extracted_text.append(page.extract_text() or "")
-
-        async with aiofiles.open(text_file_path, "w", encoding="utf-8") as f:
-            await f.write("\n".join(extracted_text))
-
-        # Отправляем текстовый файл
-        async with aiofiles.open(text_file_path, "rb") as f:
-            await update.message.reply_document(
-                document=InputFile(f, filename=os.path.basename(text_file_path)),
-                caption="✅ Конвертация завершена! Вот ваш текст:"
-            )
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при обработке PDF: {e}")
-
-    finally:
-        # Чистим временные файлы
-        try:
-            os.remove(file_path)
-            os.remove(text_file_path)
-        except Exception:
-            pass
+    elif query.data == "split_pdf":
+        reader = PdfReader(pdf_path)
+        pages = len(reader.pages)
+        await query.edit_message_text(f"📑 В файле {pages} страниц. Функция разделения пока в разработке.")
 
 
-# 📌 Главная функция
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    app.run_polling()
+# --- FASTAPI ROUTES ---
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return JSONResponse({"ok": True})
 
 
-if __name__ == "__main__":
-    main()
+@app.on_event("startup")
+async def on_startup():
+    await telegram_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(MessageHandler(filters.Document.PDF, handle_file))
+    telegram_app.add_handler(CallbackQueryHandler(button_handler))
+
+
+@app.get("/")
+async def home():
+    return {"status": "ok", "message": "PDF Bot is running 🚀"}
