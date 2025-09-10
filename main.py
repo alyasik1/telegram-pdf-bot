@@ -58,8 +58,8 @@ async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пожалуйста, отправьте файл в формате PDF.")
         return
 
-    if document.file_size > 100*1024*1024:
-        await update.message.reply_text("Файл слишком большой (макс. 100 МБ).")
+    if document.file_size > 50*1024*1024:
+        await update.message.reply_text("Файл слишком большой (макс. 50 МБ).")
         return
 
     await update.message.reply_text("Файл получен, начинаю конвертацию…")
