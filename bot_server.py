@@ -1,122 +1,99 @@
 import os
 import logging
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-)
-from contextlib import asynccontextmanager
-from pdfminer.high_level import extract_text
-from PyPDF2 import PdfReader
-from pdf2image import convert_from_path
-import pytesseract
 import asyncio
+from fastapi import FastAPI, Request
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import MessageHandler, filters
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from dotenv import load_dotenv
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например: https://your-app.up.railway.app
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-if not BOT_TOKEN or not WEBHOOK_URL:
-    raise RuntimeError("BOT_TOKEN и WEBHOOK_URL должны быть заданы")
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
+app = FastAPI()
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-# --- Стартовое приветствие ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+MAX_FILE_SIZE = 200 * 1024 * 1024  # 200 MB
+
+# ----------- Helper Functions -----------
+def main_menu_keyboard():
     keyboard = [
-        [InlineKeyboardButton("📥 Загрузить PDF", callback_data="upload_pdf")]
+        [InlineKeyboardButton("📄 Скачать TXT", callback_data="download_txt")],
+        [InlineKeyboardButton("📝 OCR (скан)", callback_data="ocr")],
+        [InlineKeyboardButton("✂️ Разделить PDF", callback_data="split_pdf")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(keyboard)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я бот для конвертации PDF.\n"
-        "Нажми кнопку ниже, чтобы начать:",
-        reply_markup=reply_markup
+        "👋 Привет! Я PDF-бот. Загрузи PDF, и я конвертирую его в текст. "
+        "Используй кнопки ниже для действий.",
+        reply_markup=main_menu_keyboard()
     )
 
-# --- Обработка PDF ---
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc.file_name.endswith(".pdf"):
-        await update.message.reply_text("❌ Пожалуйста, отправьте PDF-файл.")
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    if not document:
+        return
+
+    if document.file_size > MAX_FILE_SIZE:
+        await update.message.reply_text("❌ Файл слишком большой. Максимум 200 МБ.")
         return
 
     await update.message.reply_text("📥 Загружаю файл...")
-    file = await doc.get_file()
-    file_path = f"/tmp/{doc.file_name}"
+    file = await document.get_file()
+    file_path = f"./{document.file_name}"
     await file.download_to_drive(file_path)
 
-    keyboard = [
-        [InlineKeyboardButton("📄 Скачать TXT", callback_data=f"to_txt|{file_path}")],
-        [InlineKeyboardButton("🔍 OCR", callback_data=f"ocr|{file_path}")],
-        [InlineKeyboardButton("✂ Разбить PDF", callback_data=f"split|{file_path}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("✅ Файл загружен! Выберите действие:", reply_markup=reply_markup)
+    await update.message.reply_text("🔄 Конвертирую PDF в текст...")
 
-# --- Кнопки ---
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        from pdfminer.high_level import extract_text
+        text = extract_text(file_path)
+        if not text.strip():
+            text = "⚠️ PDF пустой или не содержит текста."
+    except Exception as e:
+        text = f"❌ Ошибка при обработке PDF: {e}"
+
+    text_file_path = file_path.replace(".pdf", ".txt")
+    with open(text_file_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    await update.message.reply_text("✅ Конвертация завершена.", reply_markup=main_menu_keyboard())
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action, file_path = query.data.split("|", maxsplit=1)
+    await query.edit_message_text(f"Вы выбрали: {query.data}\n⚠️ Пока эта функция недоступна.")
 
-    if action == "to_txt":
-        await query.edit_message_text("🔄 Конвертирую PDF в текст...")
-        text = extract_text(file_path)
-        txt_path = file_path.replace(".pdf", ".txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        await query.edit_message_text(f"✅ TXT готов! Файл: {txt_path}")
-    elif action == "ocr":
-        await query.edit_message_text("🔍 Распознаю текст через OCR...")
-        images = convert_from_path(file_path)
-        text = ""
-        for img in images:
-            text += pytesseract.image_to_string(img)
-        txt_path = file_path.replace(".pdf", "_ocr.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        await query.edit_message_text(f"✅ OCR завершён! Файл: {txt_path}")
-    elif action == "split":
-        await query.edit_message_text("✂ Разбиваю PDF...")
-        reader = PdfReader(file_path)
-        for i, page in enumerate(reader.pages):
-            writer = PdfReader()
-            writer.add_page(page)
-            split_path = file_path.replace(".pdf", f"_page_{i+1}.pdf")
-            with open(split_path, "wb") as f:
-                writer.write(f)
-        await query.edit_message_text("✅ PDF разбит!")
+# ----------- Telegram Handlers -----------
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+telegram_app.add_handler(CallbackQueryHandler(button_handler))
 
-# --- Webhook для FastAPI ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+# ----------- FastAPI Webhook -----------
+@app.on_event("startup")
+async def on_startup():
     logger.info("🚀 Устанавливаю webhook...")
-    await telegram_app.bot.set_webhook(WEBHOOK_URL + "/webhook")
-    yield
-    logger.info("🛑 Удаляю webhook...")
-    await telegram_app.bot.delete_webhook()
-
-app = FastAPI(lifespan=lifespan)
+    await telegram_app.bot.set_webhook(WEBHOOK_URL)
 
 @app.post("/webhook")
-async def webhook_handler(request: Request):
+async def telegram_webhook(req: Request):
     try:
-        data = await request.json()
-        update = Update.de_json(data, telegram_app.bot)
-        await telegram_app.process_update(update)
+        update = Update.de_json(await req.json(), telegram_app.bot)
+        await telegram_app.update_queue.put(update)
+        return {"ok": True}
     except Exception as e:
         logger.error(f"❌ Ошибка при обработке webhook: {e}")
-        return JSONResponse(content={"ok": False}, status_code=500)
-    return JSONResponse(content={"ok": True})
+        return {"ok": False}
 
-@app.get("/")
-async def root():
-    return {"status": "бот работает 🚀"}
-
-# --- Регистрация хендлеров ---
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
-telegram_app.add_handler(CallbackQueryHandler(button_callback))
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
