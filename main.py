@@ -1,30 +1,38 @@
 import os
 import logging
-from fastapi import FastAPI, Request
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-from pdf_converter import convert_pdf_to_text
-from keyboards import main_keyboard
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import pdfplumber
 
 # Переменные окружения
 TOKEN = os.getenv("TOKEN")
-PORT = int(os.getenv("PORT", 8000))
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI приложение
-app = FastAPI()
+# ----- Конвертация PDF в текст -----
+def convert_pdf_to_text(pdf_path):
+    txt_path = pdf_path.replace(".pdf", ".txt")
+    with pdfplumber.open(pdf_path) as pdf:
+        text = ""
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    return txt_path
 
-# ----- Обработчики команд -----
+# ----- Клавиатура -----
+def main_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("Отправить PDF", callback_data="send_pdf")],
+        [InlineKeyboardButton("Помощь", callback_data="help")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ----- Обработчики -----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я PDF конвертер. Выберите действие ниже:",
@@ -36,21 +44,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Отправьте PDF-файл, и я конвертирую его в текстовый файл (.txt) и верну вам."
     )
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Сервер работает нормально.")
-
-# ----- Обработчик инлайн-кнопок -----
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "send_pdf":
         await query.message.reply_text("Пожалуйста, отправьте PDF-файл.")
     elif query.data == "help":
-        await query.message.reply_text(
-            "Отправьте PDF-файл, и я конвертирую его в текстовый файл (.txt) и верну вам."
-        )
+        await query.message.reply_text("Отправьте PDF-файл, и я конвертирую его в текстовый файл (.txt).")
 
-# ----- Обработчик PDF -----
 async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     if not document.file_name.lower().endswith(".pdf"):
@@ -75,34 +76,18 @@ async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка при конвертации: {e}")
         await update.message.reply_text("Произошла ошибка при конвертации файла.")
     finally:
-        # Очистка временных файлов
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
         if os.path.exists(txt_path):
             os.remove(txt_path)
 
-# ----- Создаем приложение Telegram -----
-application = ApplicationBuilder().token(TOKEN).build()
+# ----- Создание приложения -----
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("help", help_command))
+app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.Document.ALL, pdf_handler))
 
-# Регистрируем обработчики
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CommandHandler("status", status))
-application.add_handler(CallbackQueryHandler(button_handler))
-application.add_handler(MessageHandler(filters.Document.ALL, pdf_handler))
-
-# ----- FastAPI webhook endpoint -----
-@app.post(f"/{TOKEN}")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.update_queue.put(update)
-    return {"ok": True}
-
-# ----- Запуск сервера -----
+# ----- Запуск -----
 if __name__ == "__main__":
-    import uvicorn
-    WEBHOOK_URL = f"https://telegram-pdf-bot-production-debc.up.railway.app/{TOKEN}"
-    import asyncio
-    asyncio.run(application.bot.set_webhook(WEBHOOK_URL))
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    app.run_polling()
